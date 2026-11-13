@@ -75,23 +75,34 @@ function PopRef:addToMainMenu(menu_items)
     }
 end
 
+function PopRef:textBoxes(pageno)
+    self.text_cache = self.text_cache or {}
+    if not self.text_cache[pageno] then
+        local doc = self.ui.document
+        local page = doc._document:openPage(pageno)
+        self.text_cache[pageno] = Render.visibleLines(page, doc:getPageTextBoxes(pageno) or {})
+        page:close()
+    end
+    return self.text_cache[pageno]
+end
+
 function PopRef:locate(src_page, dest_page, target)
     local doc = self.ui.document
-    local info = Detect.textAt(doc:getPageTextBoxes(src_page), target, doc:getPageLinks(src_page))
+    local info = Detect.textAt(self:textBoxes(src_page), target, doc:getPageLinks(src_page))
     local kind, label, numbers, run = Detect.classify(info)
     local dims = doc:getNativePageDimensions(dest_page)
     local neighbor = dest_page < doc:getPageCount() and dest_page + 1 or dest_page - 1
     local page = doc._document:openPage(dest_page)
     local ink, free_ink = Render.inkMap(page, DrawContext.new(), dims.w, dims.h)
     page:close()
-    local ok, region = pcall(Detect.region, doc:getPageTextBoxes(dest_page), { w = dims.w, h = dims.h },
+    local ok, region = pcall(Detect.region, self:textBoxes(dest_page), { w = dims.w, h = dims.h },
         target.pos or {}, kind, label, {
-            neighbor = neighbor >= 1 and doc:getPageTextBoxes(neighbor) or nil,
+            neighbor = neighbor >= 1 and self:textBoxes(neighbor) or nil,
             numbers = numbers,
             run = run,
             source_y = src_page == dest_page and target.y0 or nil,
             next_page = dest_page < doc:getPageCount() and {
-                lines = doc:getPageTextBoxes(dest_page + 1),
+                lines = self:textBoxes(dest_page + 1),
                 page = doc:getNativePageDimensions(dest_page + 1),
             } or nil,
             ink = ink,

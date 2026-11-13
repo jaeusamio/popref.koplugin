@@ -144,9 +144,42 @@ local function norm_text(text)
     return (text:gsub("%d", ""):gsub("%s+", " "))
 end
 
+-- "1." or "[1]" extracted as a line of its own, left of the entry text.
+local function merge_entry_numbers(lines)
+    local merged, used = {}, {}
+    for i, l in ipairs(lines) do
+        if #l == 1 and (l[1].word:match("^%d+%.$") or l[1].word:match("^%[%d+%]$")) then
+            local h = l.y1 - l.y0
+            local best, best_j
+            for j, m in ipairs(lines) do
+                if not used[j] and m.x0 > l.x1 and m.x0 - l.x1 < 2 * h
+                        and math.abs((m.y0 + m.y1) - (l.y0 + l.y1)) < h * 0.5 and (not best or m.x0 < best.x0) then
+                    best, best_j = m, j
+                end
+            end
+            if best then
+                used[i], used[best_j] = true, true
+                local m = { l[1], x0 = l.x0, y0 = math.min(l.y0, best.y0), x1 = best.x1, y1 = math.max(l.y1, best.y1) }
+                for _, w in ipairs(best) do table.insert(m, w) end
+                merged[i] = m
+            end
+        end
+    end
+    local out = {}
+    for i, l in ipairs(lines) do
+        if merged[i] then
+            table.insert(out, merged[i])
+        elseif not used[i] then
+            table.insert(out, l)
+        end
+    end
+    return out
+end
+
 -- Drops rotated side text and running headers/footers (lines repeated at the
 -- same height on a neighbouring page).
 local function clean_lines(lines, page, neighbor)
+    lines = merge_entry_numbers(lines)
     local heights = {}
     for _, l in ipairs(lines) do
         table.insert(heights, l.y1 - l.y0)
@@ -385,10 +418,19 @@ local function ink_split(ink, rows, own, cx0, cx1, from, to, lh)
         if cov(y) > 0 then
             local ruled = is_rule(last_ink) or is_rule(y + step)
             if seen_ink and blank >= lh * (ruled and 0.7 or 1.2) then
+                -- a caption further away, past more of our own float, does
+                -- not count unless a rule closes the other float
+                local nearest
+                for i, r in ipairs(rows) do
+                    if step > 0 and r.y0 >= y - 1 and (not nearest or r.y0 < rows[nearest].y0)
+                            or step < 0 and r.y1 <= y + 1 and (not nearest or r.y1 > rows[nearest].y1) then
+                        nearest = i
+                    end
+                end
                 for i, r in ipairs(rows) do
                     local beyond = step > 0 and r.y0 >= y - 1 or step < 0 and r.y1 <= y + 1
                     local within = step > 0 and r.y0 < to or step < 0 and r.y1 > to
-                    if beyond and (r.caption and i ~= own or within and blank >= lh * 2.2) then
+                    if beyond and (r.caption and i ~= own and (ruled or i == nearest) or within and blank >= lh * 2.2) then
                         return blank_start
                     end
                 end
@@ -401,7 +443,7 @@ local function ink_split(ink, rows, own, cx0, cx1, from, to, lh)
     end
 end
 
-local function float_region(lines, lay, cap, kind, dest, ink)
+local function float_region(lines, lay, page, cap, kind, dest, ink)
     local cx0, cx1 = column_of(lay, cap)
     if caption_spans(lines, cap, lay) then cx0, cx1 = lay.x0, lay.x1 end
     local rows = build_rows(lines, cx0, cx1)
@@ -462,6 +504,19 @@ local function float_region(lines, lay, cap, kind, dest, ink)
             end
         end
         if not prose then cx0, cx1 = lay.x0, lay.x1 end
+    end
+
+    -- graphics wider than the text column (indented body text)
+    if ink then
+        local function free(x0, x1)
+            for _, l in ipairs(lines) do
+                if l.x1 > x0 and l.x0 < x1 and l.y1 > top and l.y0 < bottom then return false end
+            end
+            return next(ink(x0, top, x1, bottom)) ~= nil
+        end
+        local step = 4
+        while cx0 - step >= 0 and free(cx0 - step, cx0) do cx0 = cx0 - step end
+        while cx1 + step <= page.w and free(cx1, cx1 + step) do cx1 = cx1 + step end
     end
     return cx0, cx1, top, bottom
 end
@@ -602,6 +657,18 @@ local function find_ref_entry(lines, numbers, dest, lay)
     end
     local best = closest_to(cands, dest)
     if best and math.abs(best.y0 - dest.y) < 3 * lay.lh then return best end
+    -- destination further down the same entry (anchored at its last line)
+    if best and best.y0 < dest.y and dest.y - best.y0 < 15 * lay.lh and is_ref_entry(line_text(best)) then
+        local inside = true
+        for _, l in ipairs(lines) do
+            local cx = (l.x0 + l.x1) / 2
+            if l.y0 > best.y0 + 1 and l.y0 < dest.y and cx >= cx0 and cx <= cx1 and is_ref_entry(line_text(l)) then
+                inside = false
+                break
+            end
+        end
+        if inside then return best end
+    end
     return closest_to(near, dest)
 end
 
@@ -719,7 +786,7 @@ function Detect.classify(info)
     for n in lt:gmatch("%d+") do table.insert(numbers, n) end
     local cited = Detect.citedNumbers(info.group or lt)
     local run = numbers[1] and consecutive_run(cited, tonumber(numbers[1]), 10) or nil
-    if lt:match("^%s*%[") then return "citation", label, numbers, run end
+    if lt:match("^%s*%[") or (info.group or ""):match("^%s*%[%s*%d") then return "citation", label, numbers, run end
 
     local kind, pos = nil, 0
     for _, kw in ipairs(KEYWORDS) do
@@ -815,7 +882,7 @@ end
 
 -- Entries of the run, continuing on the next page for the numbers that come
 -- after the last one found on this page.
-local function entries_region(lines, lay, page, run, anchor, next_page)
+local function entries_region(lines, lay, page, run, anchor, next_page, raw)
     local known_n = entry_number(anchor)
     local entries = #run > 1 and find_entries(lines, lay, run, anchor, known_n) or { anchor }
     local parts, spill = entries_parts(lines, lay, page, entries, 0)
@@ -826,7 +893,7 @@ local function entries_region(lines, lay, page, run, anchor, next_page)
         if n > last_n then table.insert(missing, n) end
     end
     if next_page and (spill or #missing > 0) then
-        local nlines, nlay = prepare(next_page.lines, next_page.page, lines)
+        local nlines, nlay = prepare(next_page.lines, next_page.page, raw)
         if nlines then
             local cx0, cx1 = column_of(nlay, nil, nlay.x0)
             if spill then
@@ -877,7 +944,8 @@ function Detect.region(lines, page, dest, kind, label, opts)
         y = finite(dest.y) and dest.y > page.h * 0.05 and dest.y or nil,
     }
     local lh, top_limit, bottom_limit
-    lines, lh, top_limit, bottom_limit = clean_lines(lines or {}, page, opts.neighbor)
+    local raw = lines or {}
+    lines, lh, top_limit, bottom_limit = clean_lines(raw, page, opts.neighbor)
     if #lines == 0 then
         local y = dest.y or 0
         return { kind = "generic", x = 0, y = y, w = page.w, h = dest.y and math.min(page.h * 0.35, page.h - y) or page.h }
@@ -916,7 +984,7 @@ function Detect.region(lines, page, dest, kind, label, opts)
 
     local cx0, cx1, top, bottom
     if kind == "figure" or kind == "table" or kind == "algorithm" then
-        cx0, cx1, top, bottom = float_region(lines, lay, anchor, kind, dest, opts.ink)
+        cx0, cx1, top, bottom = float_region(lines, lay, page, anchor, kind, dest, opts.ink)
     else
         cx0, cx1 = column_of(lay, anchor)
         local rows = build_rows(lines, cx0, cx1)
@@ -924,7 +992,7 @@ function Detect.region(lines, page, dest, kind, label, opts)
         if kind == "note" then
             top, bottom = rows[idx].y0, rows[block_end(rows, idx, lay, lay.lh * 0.8, 6)].y1
         elseif kind == "citation" then
-            return entries_region(lines, lay, page, opts.run or {}, anchor, opts.next_page)
+            return entries_region(lines, lay, page, opts.run or {}, anchor, opts.next_page, raw)
         elseif kind == "equation" then
             if numbered then
                 -- multi-line displays: centred rows right above the numbered one
@@ -1129,6 +1197,17 @@ function Detect.textAt(lines, rect, links)
         else
             info.text, info.group = partial.word, partial.word
             info.before = table.concat(partial_before, " ")
+            -- one link per number of "[14,19,20]": the number under the link
+            if rect.x1 - rect.x0 < (partial.x1 - partial.x0) * 0.6 then
+                local text = normalize_dashes(partial.word)
+                local cw = (partial.x1 - partial.x0) / #text
+                local mid = ((rect.x0 + rect.x1) / 2 - partial.x0) / cw + 1
+                local best_d
+                for s, n, e in text:gmatch("()(%d+)()") do
+                    local d = math.abs((s + e) / 2 - mid)
+                    if not best_d or d < best_d then info.text, best_d = n, d end
+                end
+            end
         end
     end
     return info

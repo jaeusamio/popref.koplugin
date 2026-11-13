@@ -1,6 +1,59 @@
 local Blitbuffer = require("ffi/blitbuffer")
+local ffi = require("ffi")
+require("ffi/mupdf")
+local W = ffi.loadlib("wrap-mupdf")
 
 local Render = {}
+
+local FZ_STEXT_CLIP = 64
+
+-- Drops the text lines of a MuPDF page that are clipped away, such as a
+-- whole other page embedded under a figure: getPageText reports them too.
+function Render.visibleLines(page, lines)
+    local opts = ffi.new("fz_stext_options")
+    opts.flags = FZ_STEXT_CLIP
+    local tp = W.mupdf_new_stext_page_from_page(page.ctx, page.page, opts)
+    if tp == nil then return lines end
+    -- chars bucketed by their left edge, which is also the left edge of the
+    -- word they start in getPageText
+    local chars = {}
+    local block = tp.first_block
+    while block ~= nil do
+        if block.type == W.FZ_STEXT_BLOCK_TEXT then
+            local l = block.u.t.first_line
+            while l ~= nil do
+                local ch = l.first_char
+                while ch ~= nil do
+                    local q = ch.quad
+                    local x = math.min(q.ul.x, q.ll.x)
+                    local k = math.floor(x)
+                    chars[k] = chars[k] or {}
+                    table.insert(chars[k], { x = x, y = (q.ul.y + q.ll.y + q.ur.y + q.lr.y) / 4 })
+                    ch = ch.next
+                end
+                l = l.next
+            end
+        end
+        block = block.next
+    end
+    W.fz_drop_stext_page(page.ctx, tp)
+    local function visible(w)
+        for k = math.floor(w.x0) - 1, math.floor(w.x0) + 1 do
+            for _, c in ipairs(chars[k] or {}) do
+                if math.abs(c.x - w.x0) < 0.05 and c.y > w.y0 and c.y < w.y1 then return true end
+            end
+        end
+    end
+    local out = {}
+    for _, l in ipairs(lines) do
+        local n = 0
+        for _, w in ipairs(l) do
+            if visible(w) then n = n + 1 end
+        end
+        if n * 2 >= #l then table.insert(out, l) end
+    end
+    return out
+end
 
 -- Renders a native-coords rect of a MuPDF page into a new BlitBuffer.
 function Render.region(page, draw_context, rect, zoom)

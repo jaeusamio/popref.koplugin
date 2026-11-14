@@ -40,7 +40,8 @@ local KEYWORDS = {
     { "%f[%a]remarks?%f[%A]", "generic" }, { "%f[%a]examples?%f[%A]", "generic" },
 }
 
-local REF_ENTRY_PATTERNS = { "^%[%d%d?%d?%]", "^%d%d?%d?%.%s", "^%(%d%d?%d?%)%s" }
+-- the last one is RSC style: "12 A. B. Author, ..."
+local REF_ENTRY_PATTERNS = { "^%[%d%d?%d?%]", "^%d%d?%d?%.%s", "^%(%d%d?%d?%)%s", "^%d%d?%d?%s%u%." }
 
 local function finite(v)
     return type(v) == "number" and v == v and v > -1e6 and v < 1e6
@@ -446,6 +447,18 @@ end
 local function float_region(lines, lay, page, cap, kind, dest, ink)
     local cx0, cx1 = column_of(lay, cap)
     if caption_spans(lines, cap, lay) then cx0, cx1 = lay.x0, lay.x1 end
+    -- body text of another column on the caption row: more than two columns
+    local left, right
+    for _, l in ipairs(lines) do
+        if l.y0 < cap.y1 and l.y1 > cap.y0 then
+            if l.x1 < cap.x0 - lay.lh * 0.5 and l.x1 + lay.lh > cx0 then
+                cx0, left = l.x1 + lay.lh, l.x1
+            elseif l.x0 > cap.x1 + 3 * lay.lh and l.x0 - lay.lh < cx1 then
+                cx1, right = l.x0 - lay.lh, l.x0
+            end
+        end
+    end
+    local beside = left or right
     local rows = build_rows(lines, cx0, cx1)
     mark_captions(rows, lay)
     local cidx = row_index(rows, cap)
@@ -489,7 +502,7 @@ local function float_region(lines, lay, page, cap, kind, dest, ink)
 
     -- A float in one column is really full width when the other column holds
     -- no body text next to it.
-    if lay.two_col and (cx1 - cx0) < (lay.x1 - lay.x0) * 0.75 then
+    if lay.two_col and not beside and (cx1 - cx0) < (lay.x1 - lay.x0) * 0.75 then
         local ox0, ox1 = lay.x0, lay.mid
         if cx0 < lay.mid - lay.lh then ox0, ox1 = lay.mid, lay.x1 end
         local other = build_rows(lines, ox0, ox1)
@@ -517,6 +530,24 @@ local function float_region(lines, lay, page, cap, kind, dest, ink)
         local step = 4
         while cx0 - step >= 0 and free(cx0 - step, cx0) do cx0 = cx0 - step end
         while cx1 + step <= page.w and free(cx1, cx1 + step) do cx1 = cx1 + step end
+    end
+    -- clear of the neighbouring column, with the padding added by Detect.region
+    if left then cx0 = math.max(cx0, left + lay.lh * 0.5 + 1) end
+    if right then cx1 = math.min(cx1, right - lay.lh * 0.5 - 1) end
+    -- a rule running on into the neighbouring column separates the page
+    -- header from the float
+    if beside and ink and top < cap_top then
+        local ox0, ox1 = lay.x0, left
+        if not left then ox0, ox1 = right, lay.x1 end
+        local prof = ink(ox0, top, ox1, cap_top)
+        local base = math.floor(top)
+        local function cov(y) return prof[y - base] or 0 end
+        for y = math.floor(cap_top) - 1, base, -1 do
+            if cov(y) >= 0.8 and cov(y - 3) < 0.5 and cov(y + 3) < 0.5 then
+                top = y + 2 + lay.lh * 0.5
+                break
+            end
+        end
     end
     return cx0, cx1, top, bottom
 end
@@ -582,9 +613,15 @@ local function mid_paragraph(lines, l, lay)
     return prev and l.y0 - prev.y1 < lay.lh * 0.6 and prev.x1 - prev.x0 >= lay.colw * 0.85
 end
 
+-- "Figure 1: Results ........ 13" in a list of figures
+local function toc_entry(text)
+    return text:match("%.%s?%.%s?%.%s?%.") or text:match("\226\128\166")
+end
+
 local function mark_caption_lines(lines, lay)
     for _, l in ipairs(lines) do
-        l.is_caption = parse_caption(line_text(l)) ~= nil and not mid_paragraph(lines, l, lay)
+        local t = line_text(l)
+        l.is_caption = parse_caption(t) ~= nil and not toc_entry(t) and not mid_paragraph(lines, l, lay)
     end
 end
 
@@ -617,7 +654,7 @@ local function closest_to(cands, dest)
 end
 
 local function entry_patterns(n)
-    return { "^%[" .. n .. "%]", "^" .. n .. "%.%s", "^%(" .. n .. "%)" }
+    return { "^%[" .. n .. "%]", "^" .. n .. "%.%s", "^%(" .. n .. "%)", "^" .. n .. "%s%u%." }
 end
 
 -- Bibliography entry for any of the numbers in the link text. A valid
@@ -848,14 +885,18 @@ local function entries_parts(lines, lay, page, entries, page_offset)
     local function add(x0, x1, top, bottom)
         x0, x1 = math.max(0, x0 - pad), math.min(page.w, x1 + pad)
         local last = parts[#parts]
-        if last and last.x == x0 and top - (last.y + last.h) < lay.lh then
-            last.h = math.max(last.h, bottom - last.y)
+        if last and math.abs(last.x - x0) < lay.lh and top - (last.y + last.h) < lay.lh then
+            local right = math.max(last.x + last.w, x1)
+            last.x = math.min(last.x, x0)
+            last.w, last.h = right - last.x, math.max(last.h, bottom - last.y)
         else
             table.insert(parts, { x = x0, y = top, w = x1 - x0, h = bottom - top, page_offset = page_offset })
         end
     end
     for i, e in ipairs(entries) do
         local cx0, cx1 = column_of(lay, e)
+        -- pages with more than two columns
+        cx0 = math.max(cx0, e.x0 - lay.lh * 0.5)
         local rows = build_rows(lines, cx0, cx1)
         local top, bottom = citation_region(rows, row_index(rows, e), lay)
         local at_end = rows[#rows].y1 <= bottom + 1
@@ -1211,6 +1252,184 @@ function Detect.textAt(lines, rect, links)
         end
     end
     return info
+end
+
+--- Line and index of the word under pos, for taps outside links.
+function Detect.wordAt(lines, pos)
+    local best_l, best_k, best_d
+    for _, l in ipairs(lines or {}) do
+        local m = (l.y1 - l.y0) * 0.2
+        if pos.y >= l.y0 - m and pos.y <= l.y1 + m then
+            for k, w in ipairs(l) do
+                local dx = math.max(w.x0 - pos.x, 0, pos.x - w.x1)
+                local dy = math.abs(pos.y - (w.y0 + w.y1) / 2)
+                local d = dx + dy * 0.1
+                if dx < (w.y1 - w.y0) * 0.5 and (not best_d or d < best_d) then
+                    best_l, best_k, best_d = l, k, d
+                end
+            end
+        end
+    end
+    return best_l, best_k
+end
+
+local function keyword_kind(word)
+    local w = word:lower():gsub("^%p+", ""):gsub("%p+$", "")
+    return CAPTION_KINDS[w] or CAPTION_KINDS[(w:gsub("s$", ""))]
+end
+
+-- "3", "1B).", "S2", "II,"
+local function label_of(word)
+    local t = word:gsub("^%p+", "")
+    local label = t:match("^(%u?%d+[%.%d]*%a?)")
+    if label then return (label:gsub("%.$", "")) end
+    return t:match("^([IVXL]+)%f[%W]")
+end
+
+-- "Fig. 1B", "Figs. 2 and 3", "TABLE II", "Scheme 4": tapped on either word.
+local function keyword_ref(line, k)
+    local kind = keyword_kind(line[k].word)
+    if kind then
+        local label = line[k + 1] and label_of(line[k + 1].word)
+        return label and kind, label
+    end
+    local label = label_of(line[k].word)
+    if not label then return end
+    for i = k - 1, math.max(1, k - 4), -1 do
+        local w = line[i].word
+        kind = keyword_kind(w)
+        if kind then return kind, label end
+        local lw = w:lower()
+        if not (label_of(w) or lw == "and" or lw == "or" or w == "&" or w:match("^%p+$")) then return end
+    end
+end
+
+-- Superscript run of chars ("13", "20-24", "1d,14b") near x: smaller than the
+-- body text and raised above its baseline. `tapped` tells whether the char
+-- nearest to x is part of it.
+local function superscript_ref(chars, x)
+    local cs, sizes, bases = {}, {}, {}
+    for _, c in ipairs(chars or {}) do
+        if c.c ~= " " then
+            table.insert(cs, c)
+            table.insert(sizes, c.size)
+        end
+    end
+    local body = median(sizes)
+    if not body then return end
+    for _, c in ipairs(cs) do
+        if c.size >= body * 0.95 then table.insert(bases, c.base) end
+    end
+    local base = median(bases) or 0
+    local function sup(c) return c.size < body * 0.85 and c.base < base - body * 0.15 end
+    local best, best_d, nearest, nearest_d
+    for i, c in ipairs(cs) do
+        local d = math.max(c.x0 - x, 0, x - c.x1)
+        if not nearest_d or d < nearest_d then nearest, nearest_d = i, d end
+        if sup(c) and (not best_d or d < best_d) then best, best_d = i, d end
+    end
+    if not best or best_d > body * 1.2 then return end
+    local lo, hi = best, best
+    while cs[lo - 1] and sup(cs[lo - 1]) and cs[lo].x0 - cs[lo - 1].x1 < body * 0.5 do lo = lo - 1 end
+    while cs[hi + 1] and sup(cs[hi + 1]) and cs[hi + 1].x0 - cs[hi].x1 < body * 0.5 do hi = hi + 1 end
+    local parts = {}
+    for i = lo, hi do table.insert(parts, cs[i].c) end
+    local group = table.concat(parts):gsub("[,%-]+$", "")
+    if not group:match("^%d[%d,%-%l]*$") then return end
+    local tapped, tapped_d
+    local i = lo
+    while i <= hi do
+        if cs[i].c:match("%d") then
+            local j = i
+            while j < hi and cs[j + 1].c:match("%d") do j = j + 1 end
+            local num = {}
+            for m = i, j do table.insert(num, cs[m].c) end
+            local d = math.max(cs[i].x0 - x, 0, x - cs[j].x1)
+            if not tapped_d or d < tapped_d then tapped, tapped_d = table.concat(num), d end
+            i = j
+        end
+        i = i + 1
+    end
+    return { text = tapped, group = group, before = "", superscript = true }, nearest >= lo and nearest <= hi
+end
+
+-- "[12]", "[3, 5]", "[18]– [21]": number nearest x in the tapped word.
+local function bracket_ref(line, k, x)
+    local first, last = bracket_group(line, k, k)
+    if not (first and last) then return end
+    -- "[18]– [21]" and "[8], [9]": one group per number in IEEE style
+    local function joins(a, b)
+        return a and b and normalize_dashes(a.word):match("%][%-,]$") and b.word:match("^%[")
+    end
+    while joins(line[last], line[last + 1]) do
+        local _, l = bracket_group(line, last + 1, last + 1)
+        if not l then break end
+        last = l
+    end
+    while joins(line[first - 1], line[first]) do
+        local f = bracket_group(line, first - 1, first - 1)
+        if not f then break end
+        first = f
+    end
+    local words = {}
+    for i = first, last do table.insert(words, line[i].word) end
+    local group = normalize_dashes(table.concat(words, " ")):gsub("%]%s*([%-,])%s*%[", "%1")
+    if not group:match("%[%s*%d") then return end
+    local w = line[k]
+    local text = normalize_dashes(w.word)
+    local mid = (x - w.x0) / ((w.x1 - w.x0) / #text) + 1
+    local tapped, best_d
+    for s, n, e in text:gmatch("()(%d+)()") do
+        local d = math.abs((s + e) / 2 - mid)
+        if not best_d or d < best_d then tapped, best_d = n, d end
+    end
+    tapped = tapped or group:match("%d+")
+    return { text = tapped, group = group, before = "" }
+end
+
+--[[--
+Reference written as plain text under a tap: a float mentioned by keyword
+("Fig. 2", "Table 1") or a numbered citation, bracketed or superscript.
+
+@param line, k from Detect.wordAt
+@param x tap position
+@param chars characters of the line ({c, x0, x1, base, size}), for superscripts
+@treturn kind, label, numbers, run as Detect.classify, or nil
+]]
+function Detect.refAt(line, k, x, chars)
+    local sup, on_sup = superscript_ref(chars, x)
+    if sup and on_sup then return Detect.classify(sup) end
+    local kind, label = keyword_ref(line, k)
+    if kind then return kind, label, {} end
+    if sup then return Detect.classify(sup) end
+    local info = bracket_ref(line, k, x)
+    if info then return Detect.classify(info) end
+end
+
+--- Whether the page holds the caption of the float kind/label.
+function Detect.hasCaption(lines, page, kind, label)
+    lines = prepare(lines, page)
+    for _, l in ipairs(lines or {}) do
+        local ckind, num = parse_caption(line_text(l))
+        if l.is_caption and ckind == kind and same_label(num, label) then return true end
+    end
+    return false
+end
+
+--- Number of bibliography entries on the page, and whether entry n is among them.
+function Detect.refEntries(lines, page, n)
+    lines = prepare(lines, page)
+    local count, found = 0, false
+    for _, l in ipairs(lines or {}) do
+        local t = line_text(l)
+        if is_ref_entry(t) then
+            count = count + 1
+            for _, p in ipairs(entry_patterns(n)) do
+                if t:match(p) then found = true end
+            end
+        end
+    end
+    return count, found
 end
 
 return Detect

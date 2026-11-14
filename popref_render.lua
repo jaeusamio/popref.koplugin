@@ -55,6 +55,45 @@ function Render.visibleLines(page, lines)
     return out
 end
 
+local DASH_CODES = { [0x2010] = true, [0x2011] = true, [0x2012] = true, [0x2013] = true, [0x2014] = true, [0x2212] = true }
+
+-- Characters whose centre lies in rect, sorted left to right:
+-- {c, x0, x1, base (baseline y), size}. Non-ASCII chars other than dashes
+-- come out as "?".
+function Render.chars(page, rect)
+    local opts = ffi.new("fz_stext_options")
+    local tp = W.mupdf_new_stext_page_from_page(page.ctx, page.page, opts)
+    if tp == nil then return {} end
+    local out = {}
+    local block = tp.first_block
+    while block ~= nil do
+        if block.type == W.FZ_STEXT_BLOCK_TEXT then
+            local l = block.u.t.first_line
+            while l ~= nil do
+                local ch = l.first_char
+                while ch ~= nil do
+                    local q = ch.quad
+                    local x0, x1 = math.min(q.ul.x, q.ll.x), math.max(q.ur.x, q.lr.x)
+                    local cx, cy = (x0 + x1) / 2, (q.ul.y + q.ll.y + q.ur.y + q.lr.y) / 4
+                    if cx >= rect.x0 and cx <= rect.x1 and cy >= rect.y0 and cy <= rect.y1 then
+                        local c = ch.c
+                        table.insert(out, {
+                            c = c < 128 and string.char(c) or DASH_CODES[c] and "-" or "?",
+                            x0 = x0, x1 = x1, base = ch.origin.y, size = ch.size,
+                        })
+                    end
+                    ch = ch.next
+                end
+                l = l.next
+            end
+        end
+        block = block.next
+    end
+    W.fz_drop_stext_page(page.ctx, tp)
+    table.sort(out, function(a, b) return a.x0 < b.x0 end)
+    return out
+end
+
 -- Renders a native-coords rect of a MuPDF page into a new BlitBuffer.
 function Render.region(page, draw_context, rect, zoom)
     draw_context:setZoom(zoom)

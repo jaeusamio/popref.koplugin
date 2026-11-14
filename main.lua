@@ -44,6 +44,14 @@ function PopRef:init()
         return orig_show_link_box(reader_link, link, ...)
     end
 
+    local orig_on_tap = self.ui.link.onTap
+    self.ui.link.onTap = function(reader_link, arg, ges)
+        if orig_on_tap(reader_link, arg, ges) then return true end
+        if G_reader_settings:nilOrTrue("popref_enabled") and G_reader_settings:isTrue("popref_unlinked") then
+            return self:showUnlinked(ges)
+        end
+    end
+
     -- KOReader takes the first link whose enlarged box contains the tap, so
     -- with adjacent links ("[27], [28]") the left one always wins. Prefer the
     -- link closest to the tap among those within reach.
@@ -70,8 +78,20 @@ function PopRef:addToMainMenu(menu_items)
     menu_items.popref = {
         text = _("Reference popups"),
         sorting_hint = "navi",
-        checked_func = function() return G_reader_settings:nilOrTrue("popref_enabled") end,
-        callback = function() G_reader_settings:flipNilOrTrue("popref_enabled") end,
+        sub_item_table = {
+            {
+                text = _("Show popups for links"),
+                checked_func = function() return G_reader_settings:nilOrTrue("popref_enabled") end,
+                callback = function() G_reader_settings:flipNilOrTrue("popref_enabled") end,
+            },
+            {
+                text = _("Detect references without links"),
+                help_text = _("Tapping a figure, scheme or table mention, or a numbered citation, shows a popup even when the document has no link there."),
+                enabled_func = function() return G_reader_settings:nilOrTrue("popref_enabled") end,
+                checked_func = function() return G_reader_settings:isTrue("popref_unlinked") end,
+                callback = function() G_reader_settings:flipNilOrFalse("popref_unlinked") end,
+            },
+        },
     }
 end
 
@@ -86,21 +106,19 @@ function PopRef:textBoxes(pageno)
     return self.text_cache[pageno]
 end
 
-function PopRef:locate(src_page, dest_page, target)
+function PopRef:locate(src_page, dest_page, dest, source_y, ref)
     local doc = self.ui.document
-    local info = Detect.textAt(self:textBoxes(src_page), target, doc:getPageLinks(src_page))
-    local kind, label, numbers, run = Detect.classify(info)
     local dims = doc:getNativePageDimensions(dest_page)
     local neighbor = dest_page < doc:getPageCount() and dest_page + 1 or dest_page - 1
     local page = doc._document:openPage(dest_page)
     local ink, free_ink = Render.inkMap(page, DrawContext.new(), dims.w, dims.h)
     page:close()
     local ok, region = pcall(Detect.region, self:textBoxes(dest_page), { w = dims.w, h = dims.h },
-        target.pos or {}, kind, label, {
+        dest, ref.kind, ref.label, {
             neighbor = neighbor >= 1 and self:textBoxes(neighbor) or nil,
-            numbers = numbers,
-            run = run,
-            source_y = src_page == dest_page and target.y0 or nil,
+            numbers = ref.numbers,
+            run = ref.run,
+            source_y = src_page == dest_page and source_y or nil,
             next_page = dest_page < doc:getPageCount() and {
                 lines = self:textBoxes(dest_page + 1),
                 page = doc:getNativePageDimensions(dest_page + 1),
@@ -109,8 +127,8 @@ function PopRef:locate(src_page, dest_page, target)
         })
     free_ink()
     if not ok then error(region) end
-    logger.dbg("PopRef:", info, "->", kind, label, run, region)
-    return region, kind, label, run
+    logger.dbg("PopRef:", ref, region)
+    return region
 end
 
 -- Size of the rendered region at zoom 1: parts are stacked vertically.
@@ -141,13 +159,89 @@ end
 
 function PopRef:showPopup(link)
     local src_page = link.pos.page
-    local dest_page = link.link.page + 1
-    local ok, region, kind, label, run = pcall(self.locate, self, src_page, dest_page, link.link)
+    local ok, kind, label, numbers, run = pcall(function()
+        local info = Detect.textAt(self:textBoxes(src_page), link.link, self.ui.document:getPageLinks(src_page))
+        logger.dbg("PopRef:", info)
+        return Detect.classify(info)
+    end)
+    if not ok then
+        logger.warn("PopRef: failed to read link text:", kind)
+        return false
+    end
+    local ref = { kind = kind, label = label, numbers = numbers, run = run }
+    return self:present(src_page, link.link.page + 1, link.link.pos or {}, link.lbox, ref,
+        function() self.ui.link:onGotoLink(link.link) end)
+end
+
+-- Page of the caption or bibliography entry `ref` points to, scanning the
+-- document: the first matching caption, the last page holding the entry.
+function PopRef:findTarget(ref)
+    local doc = self.ui.document
+    local n = doc:getPageCount()
+    if ref.kind == "citation" then
+        local want = ref.run and ref.run[1] or tonumber(ref.numbers[1])
+        if not want then return end
+        for p = n, 1, -1 do
+            local count, found = Detect.refEntries(doc:getPageTextBoxes(p), doc:getNativePageDimensions(p), want)
+            if found and count >= 3 then
+                ref.numbers = { want }
+                return p
+            end
+        end
+        return
+    end
+    for p = 1, n do
+        if Detect.hasCaption(doc:getPageTextBoxes(p), doc:getNativePageDimensions(p), ref.kind, ref.label) then
+            return p
+        end
+    end
+end
+
+function PopRef:findUnlinked(pos)
+    local lines = self:textBoxes(pos.page)
+    local line, k = Detect.wordAt(lines, pos)
+    if not line then return end
+    local page = self.ui.document._document:openPage(pos.page)
+    local chars = Render.chars(page, line)
+    page:close()
+    local kind, label, numbers, run = Detect.refAt(line, k, pos.x, chars)
+    if kind ~= "figure" and kind ~= "table" and kind ~= "algorithm" and kind ~= "citation" then return end
+    local ref = { kind = kind, label = label, numbers = numbers, run = run }
+    self.targets = self.targets or {}
+    local key = kind .. "|" .. tostring(run and run[1] or label)
+    if self.targets[key] == nil then
+        local page_no = self:findTarget(ref)
+        self.targets[key] = page_no and { page = page_no, numbers = ref.numbers } or false
+    end
+    local target = self.targets[key]
+    if not target then return end
+    ref.numbers = target.numbers
+    local w = line[k]
+    return target.page, ref, Geom:new{ x = w.x0, y = w.y0, w = w.x1 - w.x0, h = w.y1 - w.y0 }
+end
+
+function PopRef:showUnlinked(ges)
+    if self.ui.document.configurable.text_wrap == 1 then return end
+    local pos = self.ui.view:screenToPageTransform(ges.pos)
+    if not pos then return end
+    local ok, dest_page, ref, box = pcall(self.findUnlinked, self, pos)
+    if not ok then
+        logger.warn("PopRef: failed to detect reference:", dest_page)
+        return
+    end
+    if not dest_page then return end
+    return self:present(pos.page, dest_page, {}, box, ref,
+        function() self.ui.link:onGotoLink({ page = dest_page - 1 }) end)
+end
+
+function PopRef:present(src_page, dest_page, dest, src_box, ref, goto_callback)
+    local ok, region = pcall(self.locate, self, src_page, dest_page, dest, src_box.y, ref)
     if not ok then
         logger.warn("PopRef: failed to locate link target:", region)
         return false
     end
     if not region then return false end
+    local kind, label, run = ref.kind, ref.label, ref.run
 
     local max_w, max_h = PopRefWidget.maxImageSize()
     local w, h = region_size(region)
@@ -170,8 +264,8 @@ function PopRef:showPopup(link)
     UIManager:show(PopRefWidget:new{
         title = title,
         image = self:render(dest_page, region, zoom),
-        link_box = self.ui.view:pageToScreenTransform(src_page, doc:nativeToPageRectTransform(src_page, link.lbox)),
-        goto_callback = function() self.ui.link:onGotoLink(link.link) end,
+        link_box = self.ui.view:pageToScreenTransform(src_page, doc:nativeToPageRectTransform(src_page, src_box)),
+        goto_callback = goto_callback,
         zoom_callback = function() self:showZoomed(dest_page, region) end,
     })
     return true

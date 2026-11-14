@@ -157,18 +157,20 @@ function PopRef:render(pageno, region, zoom)
     return Render.stack(bbs, math.ceil(6 * zoom))
 end
 
+function PopRef:linkRef(src_page, link)
+    local info = Detect.textAt(self:textBoxes(src_page), link, self.ui.document:getPageLinks(src_page))
+    logger.dbg("PopRef:", info)
+    local kind, label, numbers, run = Detect.classify(info)
+    return { kind = kind, label = label, numbers = numbers, run = run }
+end
+
 function PopRef:showPopup(link)
     local src_page = link.pos.page
-    local ok, kind, label, numbers, run = pcall(function()
-        local info = Detect.textAt(self:textBoxes(src_page), link.link, self.ui.document:getPageLinks(src_page))
-        logger.dbg("PopRef:", info)
-        return Detect.classify(info)
-    end)
+    local ok, ref = pcall(self.linkRef, self, src_page, link.link)
     if not ok then
-        logger.warn("PopRef: failed to read link text:", kind)
+        logger.warn("PopRef: failed to read link text:", ref)
         return false
     end
-    local ref = { kind = kind, label = label, numbers = numbers, run = run }
     return self:present(src_page, link.link.page + 1, link.link.pos or {}, link.lbox, ref,
         function() self.ui.link:onGotoLink(link.link) end)
 end

@@ -25,8 +25,12 @@ Works with PDFs that have a text layer; reflow mode is not supported.
 
 ## Installation
 
-Copy (or clone) the `popref.koplugin` directory into KOReader's `plugins/`
-directory on your device, then restart KOReader.
+Download `popref.koplugin-<version>.zip` from the
+[latest release](https://github.com/jaeusamio/popref.koplugin/releases/latest),
+extract it into KOReader's `plugins/` directory on your device, then restart
+KOReader.
+
+Alternatively, clone the repository into `plugins/`:
 
 ```sh
 git clone https://github.com/jaeusamio/popref.koplugin.git

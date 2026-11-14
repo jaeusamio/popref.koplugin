@@ -119,6 +119,10 @@ function PopRef:locate(src_page, dest_page, dest, source_y, ref)
             numbers = ref.numbers,
             run = ref.run,
             source_y = src_page == dest_page and source_y or nil,
+            prev_page = dest_page > 1 and {
+                lines = self:textBoxes(dest_page - 1),
+                page = doc:getNativePageDimensions(dest_page - 1),
+            } or nil,
             next_page = dest_page < doc:getPageCount() and {
                 lines = self:textBoxes(dest_page + 1),
                 page = doc:getNativePageDimensions(dest_page + 1),

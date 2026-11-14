@@ -921,17 +921,29 @@ local function prepare(lines, page, neighbor)
     return lines, lay
 end
 
--- Entries of the run, continuing on the next page for the numbers that come
--- after the last one found on this page.
-local function entries_region(lines, lay, page, run, anchor, next_page, raw)
+-- Entries of the run, continuing on the previous and next pages for the
+-- numbers that come before the first or after the last one found on this page.
+local function entries_region(lines, lay, page, run, anchor, next_page, raw, prev_page)
     local known_n = entry_number(anchor)
     local entries = #run > 1 and find_entries(lines, lay, run, anchor, known_n) or { anchor }
     local parts, spill = entries_parts(lines, lay, page, entries, 0)
     local count = #entries
     local last_n = entry_number(entries[#entries]) or known_n or 0
-    local missing = {}
+    local first_n = entry_number(entries[1]) or known_n or 0
+    local missing, before = {}, {}
     for _, n in ipairs(run) do
         if n > last_n then table.insert(missing, n) end
+        if n < first_n then table.insert(before, n) end
+    end
+    if prev_page and #before > 0 then
+        local plines, play = prepare(prev_page.lines, prev_page.page, raw)
+        local first = plines and find_entries(plines, play, { before[1] }, nil, nil)[1]
+        if first then
+            local earlier = find_entries(plines, play, before, first, before[1])
+            local pparts = entries_parts(plines, play, prev_page.page, earlier, -1)
+            for k = #pparts, 1, -1 do table.insert(parts, 1, pparts[k]) end
+            count = count + #earlier
+        end
     end
     if next_page and (spill or #missing > 0) then
         local nlines, nlay = prepare(next_page.lines, next_page.page, raw)
@@ -970,11 +982,12 @@ end
     numbers = integers of the link text (from Detect.classify),
     run = consecutive cited numbers to show together (from Detect.classify),
     next_page = {lines, page} of the following page, where a run of references may continue,
+    prev_page = {lines, page} of the preceding page, where a run of references may start,
     source_y = y of the link when it is on the destination page itself,
     ink = function(x0, y0, x1, y1) -> {[y - floor(y0)] = fraction of the row covered by ink}, 1pt per row,
 }
 @treturn table|nil {kind, x, y, w, h} in native page coords, plus
-    `parts` (list of rects to stack, each with `page_offset` 0 or 1 relative
+    `parts` (list of rects to stack, each with `page_offset` -1, 0 or 1 relative
     to the destination page) and `count` when several entries are shown
 ]]
 function Detect.region(lines, page, dest, kind, label, opts)
@@ -1033,7 +1046,7 @@ function Detect.region(lines, page, dest, kind, label, opts)
         if kind == "note" then
             top, bottom = rows[idx].y0, rows[block_end(rows, idx, lay, lay.lh * 0.8, 6)].y1
         elseif kind == "citation" then
-            return entries_region(lines, lay, page, opts.run or {}, anchor, opts.next_page, raw)
+            return entries_region(lines, lay, page, opts.run or {}, anchor, opts.next_page, raw, opts.prev_page)
         elseif kind == "equation" then
             if numbered then
                 -- multi-line displays: centred rows right above the numbered one
@@ -1227,6 +1240,12 @@ function Detect.textAt(lines, rect, links)
         info.text = table.concat(hit, " ")
         info.before = table.concat(before, " ")
         if info.group == "" then info.group = info.text end
+        -- superscript range split into two words: "hazard.18–" "21"
+        local prefix, from = normalize_dashes(before[2]):match("^(.-)(%d+)%-$")
+        if prefix and prefix ~= "" and info.text:match("^%d") then
+            info.group = from .. "-" .. info.text
+            info.superscript = true
+        end
         return info
     end
     if partial then

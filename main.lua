@@ -145,20 +145,34 @@ local function region_size(region)
     return w, h
 end
 
-function PopRef:render(pageno, region, zoom)
+-- With color, MuPDF is momentarily switched to RGB (even on grayscale devices)
+-- and the view gamma is skipped, so the result keeps the document's true colors.
+function PopRef:render(pageno, region, zoom, color)
     local doc = self.ui.document
+    local mudoc = doc._document
     local dc = DrawContext.new()
     local gamma = self.ui.view.state.gamma
-    if gamma and gamma ~= doc.GAMMA_NO_GAMMA then
+    if not color and gamma and gamma ~= doc.GAMMA_NO_GAMMA then
         dc:setGamma(gamma)
     end
-    local bbs = {}
-    for _, rect in ipairs(region.parts or { region }) do
-        local page = doc._document:openPage(pageno + (rect.page_offset or 0))
-        table.insert(bbs, Render.trim(Render.region(page, dc, rect, zoom), math.ceil(4 * zoom)))
-        page:close()
+    local was_color = mudoc.color
+    if color and mudoc.setColorRendering then
+        mudoc:setColorRendering(true)
     end
-    return Render.stack(bbs, math.ceil(6 * zoom))
+    local ok, out = pcall(function()
+        local bbs = {}
+        for _, rect in ipairs(region.parts or { region }) do
+            local page = mudoc:openPage(pageno + (rect.page_offset or 0))
+            table.insert(bbs, Render.trim(Render.region(page, dc, rect, zoom), math.ceil(4 * zoom)))
+            page:close()
+        end
+        return Render.stack(bbs, math.ceil(6 * zoom))
+    end)
+    if color and mudoc.setColorRendering then
+        mudoc:setColorRendering(was_color)
+    end
+    if not ok then error(out) end
+    return out
 end
 
 function PopRef:linkRef(src_page, link)
@@ -285,7 +299,7 @@ function PopRef:showZoomed(pageno, region)
         zoom = math.sqrt(max_pixels / (w * h))
     end
     UIManager:show(ImageViewer:new{
-        image = self:render(pageno, region, zoom),
+        image = self:render(pageno, region, zoom, true),
         image_disposable = true,
         with_title_bar = false,
         fullscreen = true,
